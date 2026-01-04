@@ -17,6 +17,7 @@ train:
   # Options: ["canny", "coloring", "deblurring", "depth", "depth_pred", "fill"]
   condition_type: "depth_pred"
   dataset:
+    path: "./scenes"
     type: "img"
     urls:
       # (Uncomment the following lines to use more data)
