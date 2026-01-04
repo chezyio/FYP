@@ -39,18 +39,26 @@ def encode_images(pipeline: FluxPipeline, images: torch.Tensor):
     """
     Encodes the images into tokens and ids for FLUX pipeline.
     """
+    # [FIX] Explicitly use the VAE's device. 
+    # In hybrid CPU/GPU setups, pipeline.device might be CPU, but VAE is GPU.
+    target_device = pipeline.vae.device
+
     images = pipeline.image_processor.preprocess(images)
-    images = images.to(pipeline.device).to(pipeline.dtype)
+    # [FIX] Move images to the VAE's device (GPU)
+    images = images.to(target_device).to(pipeline.dtype)
+    
     images = pipeline.vae.encode(images).latent_dist.sample()
     images = (
         images - pipeline.vae.config.shift_factor
     ) * pipeline.vae.config.scaling_factor
     images_tokens = pipeline._pack_latents(images, *images.shape)
+    
+    # [FIX] Ensure IDs are created on the same device (GPU)
     images_ids = pipeline._prepare_latent_image_ids(
         images.shape[0],
         images.shape[2],
         images.shape[3],
-        pipeline.device,
+        target_device,
         pipeline.dtype,
     )
     if images_tokens.shape[1] != images_ids.shape[0]:
@@ -58,7 +66,7 @@ def encode_images(pipeline: FluxPipeline, images: torch.Tensor):
             images.shape[0],
             images.shape[2] // 2,
             images.shape[3] // 2,
-            pipeline.device,
+            target_device,
             pipeline.dtype,
         )
     return images_tokens, images_ids
@@ -97,7 +105,7 @@ def convert_to_condition(
         )
         return condition_image
     else:
-        print("Warning: Returning the raw image.")
+        # print("Warning: Returning the raw image.")
         return raw_img.convert("RGB")
 
 
@@ -514,7 +522,11 @@ def generate(
     else:
         batch_size = prompt_embeds.shape[0]
 
-    device = self._execution_device
+    # [FIX] Determine device based on Transformer availability (likely GPU) vs pipeline execution device (likely CPU in hybrid)
+    if hasattr(self, "transformer") and hasattr(self.transformer, "device"):
+        device = self.transformer.device 
+    else:
+        device = self._execution_device
 
     # Prepare prompt embeddings
     (
@@ -603,9 +615,9 @@ def generate(
                     values.clear()
 
     branch_n = len(conditions) + 2
-    group_mask = torch.ones([branch_n, branch_n], dtype=torch.bool)
+    group_mask = torch.ones([branch_n, branch_n], dtype=torch.bool, device=device)
     # Disable the attention cross different condition branches
-    group_mask[2:, 2:] = torch.diag(torch.tensor([1] * len(conditions)))
+    group_mask[2:, 2:] = torch.diag(torch.tensor([1] * len(conditions), device=device))
     # Disable the attention from condition branches to image branch and text branch
     if kv_cache:
         group_mask[2:, :2] = False
