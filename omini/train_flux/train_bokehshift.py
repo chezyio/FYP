@@ -226,6 +226,33 @@ from ..pipeline.flux_omini import Condition, generate, transformer_forward, enco
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==========================================
+# 0. HELPER FUNCTIONS (Metadata Logic)
+# ==========================================
+def get_metadata(img_path):
+    """Extracted as a standalone function so test_function can use it too."""
+    try:
+        # Map .../image/X.jpg -> .../config/X.json
+        image_dir = os.path.dirname(img_path)       # .../image
+        subfolder_dir = os.path.dirname(image_dir)  # .../rock_focal_105
+        filename = os.path.basename(img_path).rsplit('.', 1)[0]
+        json_path = os.path.join(subfolder_dir, "config", f"{filename}.json")
+        
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def construct_prompt(metadata):
+    """Constructs the prompt from metadata."""
+    fl = metadata.get('focal_length', 'standard')
+    aperture = metadata.get('aperture', 'standard')
+    dist = metadata.get('focus_distance', 'unknown')
+    # Customized prompt template
+    return f"A clear photo with focal length {fl}, aperture {aperture}, focus distance {dist}."
+
+# ==========================================
 # 1. DATASET LOGIC
 # ==========================================
 class CustomDataset(Dataset):
@@ -238,7 +265,6 @@ class CustomDataset(Dataset):
         self.scene_groups = {}
         self._parse_dataset()
         
-        # Filter groups with at least 1 image
         self.scene_keys = [k for k, v in self.scene_groups.items() if len(v) >= 1]
         print(f">> Dataset loaded. Found {len(self.scene_keys)} scene groups in '{root_dir}'.")
 
@@ -257,26 +283,6 @@ class CustomDataset(Dataset):
                 self.scene_groups[group_id] = []
             self.scene_groups[group_id].append(img_path)
 
-    def get_metadata(self, img_path):
-        try:
-            image_dir = os.path.dirname(img_path)
-            subfolder_dir = os.path.dirname(image_dir)
-            filename = os.path.basename(img_path).rsplit('.', 1)[0]
-            json_path = os.path.join(subfolder_dir, "config", f"{filename}.json")
-            
-            if os.path.exists(json_path):
-                with open(json_path, 'r') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-
-    def construct_prompt(self, metadata):
-        fl = metadata.get('focal_length', 'standard')
-        aperture = metadata.get('aperture', 'standard')
-        dist = metadata.get('focus_distance', 'unknown')
-        return f"A clear photo with focal length {fl}, aperture {aperture}, focus distance {dist}."
-
     def __len__(self):
         return len(self.scene_keys)
 
@@ -294,8 +300,9 @@ class CustomDataset(Dataset):
             target_img = Image.open(target_path).convert("RGB")
             source_img = Image.open(source_path).convert("RGB")
             
-            target_meta = self.get_metadata(target_path)
-            prompt = self.construct_prompt(target_meta)
+            # Use helper functions
+            target_meta = get_metadata(target_path)
+            prompt = construct_prompt(target_meta)
             
             target_img = target_img.resize(self.target_size)
             source_img = source_img.resize(self.condition_size)
@@ -306,6 +313,7 @@ class CustomDataset(Dataset):
                 "condition_type_0": "bokeh_edit", 
                 "position_delta_0": np.array([0, 0]),
                 "description": prompt,
+                "debug_path": target_path # Optional: Pass path for debug if needed
             }
         except Exception as e:
             print(f"Error loading {target_path}: {e}")
@@ -369,20 +377,16 @@ class LowVRAMOminiModel(L.LightningModule):
         flux_pipe.text_encoder_2.requires_grad_(False)
         flux_pipe.vae.requires_grad_(False)
 
-        # [CRITICAL FIX] Wrap pipeline in a list to hide it from Lightning/PyTorch's 
-        # recursive .to(device) calls. This ensures T5 stays on CPU.
+        # [CRITICAL FIX] Wrap pipeline in a list to hide it from Lightning/PyTorch
         self._pipe_container = [flux_pipe]
 
-        # Initialize LoRA
         self.lora_layers = self.init_lora(lora_config)
         
-        # Cleanup
         torch.cuda.empty_cache()
         gc.collect()
 
     @property
     def flux_pipe(self):
-        # Accessor to get the pipeline from the container
         return self._pipe_container[0]
 
     def init_lora(self, lora_config: dict):
@@ -407,7 +411,6 @@ class LowVRAMOminiModel(L.LightningModule):
             lr = 1e-4
         else:
             lr = cfg_lr
-            
         weight_decay = float(self.optimizer_config["params"].get("weight_decay", 1e-2))
         
         optimizer = bnb.optim.AdamW8bit(
@@ -418,13 +421,11 @@ class LowVRAMOminiModel(L.LightningModule):
         return optimizer
 
     def training_step(self, batch, batch_idx):
-        # Aggressive cache clearing to handle 12GB constraint
         if batch_idx % 10 == 0:
             torch.cuda.empty_cache()
 
         imgs, prompts = batch["image"], batch["description"]
         
-        # Retrieve pipeline and set target device (GPU)
         pipe = self.flux_pipe
         target_device = pipe.vae.device 
         
@@ -438,7 +439,6 @@ class LowVRAMOminiModel(L.LightningModule):
             x_0, img_ids = encode_images(pipe, imgs)
 
             # 2. Encode Prompts (FORCE CPU)
-            # We explicitly use the CPU-resident text encoders
             (
                 prompt_embeds,
                 pooled_prompt_embeds,
@@ -446,11 +446,11 @@ class LowVRAMOminiModel(L.LightningModule):
             ) = pipe.encode_prompt(
                 prompt=prompts,
                 prompt_2=None,
-                device="cpu", # Ensure calculation happens on CPU
+                device="cpu", 
                 num_images_per_prompt=1,
                 max_sequence_length=512,
             )
-            # Move results to GPU for the Transformer
+            # Move results to GPU
             prompt_embeds = prompt_embeds.to(target_device).to(self.my_dtype)
             pooled_prompt_embeds = pooled_prompt_embeds.to(target_device).to(self.my_dtype)
             text_ids = text_ids.to(target_device).to(self.my_dtype)
@@ -503,33 +503,49 @@ class LowVRAMOminiModel(L.LightningModule):
         return step_loss
 
 # ==========================================
-# 3. TEST FUNCTION
+# 3. TEST FUNCTION (UPDATED for VERIFICATION)
 # ==========================================
 @torch.no_grad()
 def test_function(model, save_path, file_name):
     condition_size = (512, 512)
     target_size = (512, 512)
     
+    # 1. Retrieve a random test image from the dataset folder
+    prompt = "Default Prompt"
+    img_path = "assets/test_in.jpg"
+    
     try:
         dataset_path = model.training_config["dataset"]["path"]
         test_images = glob.glob(os.path.join(dataset_path, "*", "*", "image", "*.jpg"))
-        img_path = test_images[0] if test_images else "assets/test_in.jpg"
-        image = Image.open(img_path).convert("RGB").resize(condition_size)
-    except:
+        
+        if test_images:
+            # Pick a random image to verify different inputs over time
+            img_path = random.choice(test_images)
+            
+            # 2. Get the REAL metadata and prompt
+            meta = get_metadata(img_path)
+            prompt = construct_prompt(meta)
+            
+            print(f"\n[Test Function] Processing Image: {img_path}")
+            print(f"[Test Function] Generated Prompt: {prompt}\n")
+            
+            image = Image.open(img_path).convert("RGB").resize(condition_size)
+        else:
+            image = Image.new("RGB", condition_size, (128, 128, 128))
+    except Exception as e:
+        print(f"[Test Function] Error fetching data: {e}")
         image = Image.new("RGB", condition_size, (128, 128, 128))
 
-    prompt = "A clear photo with focal length 50mm, aperture f/1.8, focus distance 1.0m."
     condition = Condition(image, "default", position_delta=[0,0])
 
     os.makedirs(save_path, exist_ok=True)
     
-    # Use the pipeline access property
     pipe = model.flux_pipe
     generator = torch.Generator(device=pipe.vae.device).manual_seed(42)
 
     res = generate(
         pipe,
-        prompt=prompt,
+        prompt=prompt, # Use the dynamic prompt
         conditions=[condition],
         height=target_size[1],
         width=target_size[0],
@@ -555,6 +571,21 @@ def main():
         condition_size=training_config["dataset"]["condition_size"],
         target_size=training_config["dataset"]["target_size"]
     )
+
+    # --- VERIFICATION BLOCK ---
+    print("\n" + "="*40)
+    print("      DATASET VERIFICATION (Check 3 Pairs)")
+    print("="*40)
+    for i in range(min(3, len(dataset))):
+        sample = dataset[i]
+        path_debug = sample.get("debug_path", "Unknown")
+        prompt_debug = sample["description"]
+        print(f"Sample {i+1}:")
+        print(f"  Image:  {path_debug}")
+        print(f"  Prompt: {prompt_debug}")
+        print("-" * 20)
+    print("="*40 + "\n")
+    # --------------------------
 
     trainable_model = LowVRAMOminiModel(
         flux_pipe_id=config["flux_path"],
