@@ -9,7 +9,7 @@ train:
   dataloader_workers: 5
   save_interval: 1000
   sample_interval: 100
-  max_steps: 1
+  max_steps: -1
   gradient_checkpointing: true # (Turn off for faster training)
   save_path: "runs"
 

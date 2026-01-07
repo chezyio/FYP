@@ -35,25 +35,41 @@ def clip_hidden_states(hidden_states: torch.FloatTensor) -> torch.FloatTensor:
     return hidden_states
 
 
-def encode_images(pipeline: FluxPipeline, images: torch.Tensor):
+def encode_images(pipeline: FluxPipeline, images: Union[torch.Tensor, Image.Image, List[Image.Image]]):
     """
     Encodes the images into tokens and ids for FLUX pipeline.
+    Handles both training Tensors and inference PIL Images.
     """
-    # [FIX] Explicitly use the VAE's device. 
-    # In hybrid CPU/GPU setups, pipeline.device might be CPU, but VAE is GPU.
+    # Determine target device/dtype from the VAE (Ground Truth)
     target_device = pipeline.vae.device
+    target_dtype = pipeline.dtype
 
-    images = pipeline.image_processor.preprocess(images)
-    # [FIX] Move images to the VAE's device (GPU)
-    images = images.to(target_device).to(pipeline.dtype)
+    # [FIX] Hybrid Preprocessing Logic
+    if isinstance(images, torch.Tensor):
+        # CASE A: Training (Input is Tensor [0, 1])
+        # 1. Move to correct device/dtype (e.g., GPU/BFloat16)
+        images = images.to(device=target_device, dtype=target_dtype)
+        
+        # 2. Manual Normalization: [0, 1] -> [-1, 1]
+        # Bypasses image_processor to prevent casting errors (uint8 mismatch)
+        images = 2.0 * images - 1.0
+    else:
+        # CASE B: Inference/Testing (Input is PIL Image)
+        # Use standard processor for resizing and normalization
+        images = pipeline.image_processor.preprocess(images)
+        # Ensure result is on correct device/dtype
+        images = images.to(device=target_device, dtype=target_dtype)
     
+    # Encode with VAE
     images = pipeline.vae.encode(images).latent_dist.sample()
+    
+    # Scale and Shift Latents
     images = (
         images - pipeline.vae.config.shift_factor
     ) * pipeline.vae.config.scaling_factor
-    images_tokens = pipeline._pack_latents(images, *images.shape)
     
-    # [FIX] Ensure IDs are created on the same device (GPU)
+    # Pack Latents
+    images_tokens = pipeline._pack_latents(images, *images.shape)
     images_ids = pipeline._prepare_latent_image_ids(
         images.shape[0],
         images.shape[2],
@@ -61,6 +77,7 @@ def encode_images(pipeline: FluxPipeline, images: torch.Tensor):
         target_device,
         pipeline.dtype,
     )
+    
     if images_tokens.shape[1] != images_ids.shape[0]:
         images_ids = pipeline._prepare_latent_image_ids(
             images.shape[0],

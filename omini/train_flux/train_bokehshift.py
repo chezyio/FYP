@@ -502,6 +502,148 @@ class LowVRAMOminiModel(L.LightningModule):
         
         return step_loss
 
+
+class HighPerformanceOminiModel(L.LightningModule):
+    def __init__(
+        self,
+        flux_pipe_id: str,
+        lora_config: dict = None,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        model_config: dict = {},
+        optimizer_config: dict = None,
+        gradient_checkpointing: bool = False, # You can turn this OFF on A100 for more speed!
+    ):
+        super().__init__()
+        self.model_config = model_config
+        self.optimizer_config = optimizer_config
+        self.adapter_names = [None, None, "default"]
+        self.my_device = device
+        self.my_dtype = dtype
+
+        print(f">> [Model] Loading Full FLUX.1-dev in {dtype} on {device}...")
+        
+        # 1. Load Full Precision Pipeline directly to GPU
+        # No BitsAndBytesConfig needed. A100 handles bfloat16 natively.
+        self.flux_pipe = FluxPipeline.from_pretrained(
+            flux_pipe_id,
+            torch_dtype=dtype
+        ).to(device)
+
+        # 2. Setup Transformer
+        self.transformer = self.flux_pipe.transformer
+        if gradient_checkpointing:
+            self.transformer.enable_gradient_checkpointing() 
+        
+        # 3. Freeze Base Components
+        self.flux_pipe.text_encoder.requires_grad_(False)
+        self.flux_pipe.text_encoder_2.requires_grad_(False)
+        self.flux_pipe.vae.requires_grad_(False)
+        self.transformer.requires_grad_(False)
+
+        # 4. Initialize LoRA
+        self.lora_layers = self.init_lora(lora_config)
+
+    def init_lora(self, lora_config: dict):
+        self.transformer.add_adapter(
+            LoraConfig(**lora_config), adapter_name="default"
+        )
+        # Enable gradients only for LoRA layers
+        lora_layers = [p for p in self.transformer.parameters() if p.requires_grad]
+        print(f">> [Model] Trainable LoRA parameters: {len(lora_layers)}")
+        return lora_layers
+
+    def save_lora(self, path: str):
+        self.flux_pipe.save_lora_weights(
+            save_directory=path,
+            weight_name="default.safetensors",
+            adapter_name="default"
+        )
+
+    def configure_optimizers(self):
+        print(">> [Optimizer] Using Standard AdamW (BF16)...")
+        lr = float(self.optimizer_config["params"]["lr"])
+        weight_decay = float(self.optimizer_config["params"].get("weight_decay", 1e-2))
+        
+        # Use Pytorch's native AdamW, which is faster than bitsandbytes on A100
+        optimizer = torch.optim.AdamW(
+            self.lora_layers, 
+            lr=lr, 
+            weight_decay=weight_decay
+        )
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        imgs, prompts = batch["image"], batch["description"]
+        
+        # Everything is already on GPU, no need for manual .to() shuffling
+        pipe = self.flux_pipe
+        
+        conditions = []
+        if "condition_0" in batch:
+            conditions.append(batch["condition_0"])
+
+        with torch.no_grad():
+            # 1. Encode Images
+            x_0, img_ids = encode_images(pipe, imgs)
+
+            # 2. Encode Prompts (FAST on GPU)
+            (
+                prompt_embeds,
+                pooled_prompt_embeds,
+                text_ids,
+            ) = pipe.encode_prompt(
+                prompt=prompts,
+                prompt_2=None,
+                device=self.device, 
+                num_images_per_prompt=1,
+                max_sequence_length=512,
+            )
+
+            # 3. Noise
+            t = torch.sigmoid(torch.randn((imgs.shape[0],), device=self.device))
+            x_1 = torch.randn_like(x_0)
+            t_ = t.unsqueeze(1).unsqueeze(1)
+            x_t = ((1 - t_) * x_0 + t_ * x_1).to(self.my_dtype)
+
+            # 4. Conditions
+            condition_latents, condition_ids = [], []
+            for cond in conditions:
+                c_latents, c_ids = encode_images(pipe, cond)
+                condition_latents.append(c_latents)
+                condition_ids.append(c_ids)
+
+            # 5. Guidance
+            if self.transformer.config.guidance_embeds:
+                guidance = torch.ones_like(t)
+            else:
+                guidance = None
+
+        # 6. Forward Pass
+        branch_n = 2 + len(conditions)
+        group_mask = torch.ones([branch_n, branch_n], dtype=torch.bool).to(self.device)
+        group_mask[2:, 2:] = torch.diag(torch.tensor([1] * len(conditions), device=self.device))
+
+        transformer_out = transformer_forward(
+            self.transformer,
+            image_features=[x_t, *(condition_latents)],
+            text_features=[prompt_embeds],
+            img_ids=[img_ids, *(condition_ids)],
+            txt_ids=[text_ids],
+            timesteps=[t, t] + [torch.zeros_like(t)] * len(conditions),
+            pooled_projections=[pooled_prompt_embeds] * branch_n,
+            guidances=[guidance] * branch_n,
+            adapters=self.adapter_names,
+            return_dict=False,
+            group_mask=group_mask,
+        )
+        pred = transformer_out[0]
+
+        step_loss = torch.nn.functional.mse_loss(pred, (x_1 - x_0), reduction="mean")
+        self.last_t = t.mean().item()
+        self.log_loss = step_loss.item() if not hasattr(self, "log_loss") else self.log_loss * 0.95 + step_loss.item() * 0.05
+        return step_loss
+
 # ==========================================
 # 3. TEST FUNCTION (UPDATED for VERIFICATION)
 # ==========================================
@@ -572,29 +714,15 @@ def main():
         target_size=training_config["dataset"]["target_size"]
     )
 
-    # --- VERIFICATION BLOCK ---
-    print("\n" + "="*40)
-    print("      DATASET VERIFICATION (Check 3 Pairs)")
-    print("="*40)
-    for i in range(min(3, len(dataset))):
-        sample = dataset[i]
-        path_debug = sample.get("debug_path", "Unknown")
-        prompt_debug = sample["description"]
-        print(f"Sample {i+1}:")
-        print(f"  Image:  {path_debug}")
-        print(f"  Prompt: {prompt_debug}")
-        print("-" * 20)
-    print("="*40 + "\n")
-    # --------------------------
-
-    trainable_model = LowVRAMOminiModel(
+    # Use the High Performance Model
+    trainable_model = HighPerformanceOminiModel(
         flux_pipe_id=config["flux_path"],
         lora_config=training_config["lora_config"],
         device="cuda",
         dtype=getattr(torch, config["dtype"]),
         optimizer_config=training_config["optimizer"],
         model_config=config.get("model", {}),
-        gradient_checkpointing=True,
+        gradient_checkpointing=False, # TRY FALSE on A100 for maximum speed!
     )
 
     train(dataset, trainable_model, config, test_function)
