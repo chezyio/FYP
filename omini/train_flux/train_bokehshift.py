@@ -414,7 +414,7 @@ def test_function(model, save_path, file_name):
     img_path = "assets/test_in.jpg"
     try:
         dataset_path = model.training_config["dataset"]["path"]
-        test_images = glob.glob(os.path.join(dataset_path, "*", "*", "image", "*.jpg"))
+        test_images = glob.glob(os.path.join(dataset_path, "*", "*", "image", "*.png"))
         if test_images:
             img_path = random.choice(test_images)
             meta = get_metadata(img_path)
